@@ -44,13 +44,11 @@ class Go2LaunchConfig:
     
     def _determine_connection_mode(self) -> str:
         """Determine connection mode based on IP list and connection type"""
-        return "single" if len(self.robot_ip_list) == 1 and self.conn_type != "cyclonedx" else "multi"
+        return "single" if len(self.robot_ip_list) == 1 else "multi"
     
     def _get_rviz_config(self) -> str:
         """Get appropriate RViz configuration file"""
-        if self.conn_type == 'cyclonedx':
-            return "cyclonedx_config.rviz"
-        elif self.conn_mode == 'single':
+        if self.conn_mode == 'single':
             return "single_robot_conf.rviz"
         else:
             return "multi_robot_conf.rviz"

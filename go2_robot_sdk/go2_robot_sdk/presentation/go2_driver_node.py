@@ -3,7 +3,9 @@
 
 import asyncio
 import logging
+import math
 import os
+import time
 from typing import Dict, Any
 
 from aiortc import MediaStreamTrack
@@ -17,11 +19,12 @@ from tf2_ros import TransformBroadcaster
 
 from geometry_msgs.msg import Twist, PoseStamped
 from go2_interfaces.msg import Go2State, IMU
-from go2_interfaces.msg import LowState, VoxelMapCompressed, WebRtcReq
+from go2_interfaces.msg import VoxelMapCompressed, WebRtcReq
 from sensor_msgs.msg import PointCloud2, JointState, Joy, Image, CameraInfo
 from nav_msgs.msg import Odometry
 
-from ..domain.entities import RobotConfig, RobotData, CameraData
+from ..domain.entities import (
+    RobotConfig, RobotData, CameraData, RobotState, IMUData, OdometryData, JointData)
 from ..application.services import RobotDataService, RobotControlService
 from ..infrastructure.ros2 import ROS2Publisher
 from ..infrastructure.webrtc import WebRTCAdapter
@@ -223,15 +226,48 @@ class Go2DriverNode(Node):
 
         # CycloneDDS support
         if self.config.conn_type == 'cyclonedds':
-            self.create_subscription(
-                LowState, 'lowstate',
-                self._on_cyclonedds_low_state, qos_profile)
-            self.create_subscription(
-                PoseStamped, '/utlidar/robot_pose',
-                self._on_cyclonedds_pose, qos_profile)
-            self.create_subscription(
-                PointCloud2, '/utlidar/cloud',
-                self._on_cyclonedds_lidar, qos_profile)
+            self._setup_cyclonedds_subscribers()
+
+    def _setup_cyclonedds_subscribers(self) -> None:
+        """Subscribe to the robot's native DDS topics (CycloneDDS over ethernet)"""
+        # The robot publishes unitree_go types. go2_interfaces has identical
+        # definitions, but DDS matches on the package name, so they won't connect.
+        try:
+            from unitree_go.msg import LowState, SportModeState
+        except ImportError:
+            self.get_logger().error(
+                "CycloneDDS mode needs the 'unitree_go' message package (from unitree_ros2). "
+                "Source the workspace that provides it before launching.")
+            return
+
+        # Robot publishers are a mix of reliable/best effort; best effort subscribers match both
+        sensor_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        self.declare_parameter('cyclonedds_lidar_topic', '/utlidar/cloud_deskewed')
+        self.declare_parameter('cyclonedds_joint_state_rate', 50.0)
+        lidar_topic = self.get_parameter('cyclonedds_lidar_topic').get_parameter_value().string_value
+        joint_rate = self.get_parameter('cyclonedds_joint_state_rate').get_parameter_value().double_value
+
+        # lowstate arrives at ~500 Hz; republishing every message is wasted work
+        self._joint_state_period = 1.0 / joint_rate if joint_rate > 0 else 0.0
+        self._last_joint_state_time = 0.0
+        self._lidar_frame_logged = False
+
+        self.create_subscription(
+            LowState, '/lowstate', self._on_cyclonedds_low_state, sensor_qos)
+        self.create_subscription(
+            SportModeState, '/lf/sportmodestate', self._on_cyclonedds_sport_state, sensor_qos)
+        self.create_subscription(
+            PoseStamped, '/utlidar/robot_pose', self._on_cyclonedds_pose, sensor_qos)
+        self.create_subscription(
+            PointCloud2, lidar_topic, self._on_cyclonedds_lidar, sensor_qos)
+
+        self.get_logger().info(
+            f"CycloneDDS: republishing /lowstate, /lf/sportmodestate, /utlidar/robot_pose, {lidar_topic}")
 
     def _on_set_parameters(self, params) -> SetParametersResult:
         """Callback for parameter changes"""
@@ -318,20 +354,81 @@ class Go2DriverNode(Node):
                 break
 
     # CycloneDDS callbacks
-    def _on_cyclonedds_low_state(self, msg: LowState) -> None:
-        """Processing LowState for CycloneDDS"""
-        # You can add processing for CycloneDDS here if needed
-        pass
+    # All robot topics are shared on the DDS network, so CycloneDDS mode is always robot "0".
+    def _on_cyclonedds_low_state(self, msg) -> None:
+        """LowState -> joint_states"""
+        now = time.monotonic()
+        if now - self._last_joint_state_time < self._joint_state_period:
+            return
+        self._last_joint_state_time = now
+
+        robot_data = RobotData(robot_id="0", timestamp=0.0)
+        robot_data.joint_data = JointData(
+            motor_state=[{'q': float(m.q), 'dq': float(m.dq), 'ddq': float(m.ddq),
+                          'tau': float(m.tau_est)} for m in msg.motor_state[:12]]
+        )
+        self.ros2_publisher.publish_joint_state(robot_data)
+
+    def _on_cyclonedds_sport_state(self, msg) -> None:
+        """SportModeState -> go2_states and imu"""
+        imu = msg.imu_state
+        float_fields = (list(msg.position) + list(msg.range_obstacle) +
+                        list(msg.foot_position_body) + list(msg.foot_speed_body) +
+                        [msg.body_height])
+        if not all(math.isfinite(v) for v in float_fields):
+            return
+
+        robot_data = RobotData(robot_id="0", timestamp=0.0)
+        robot_data.robot_state = RobotState(
+            mode=int(msg.mode),
+            progress=int(msg.progress),
+            gait_type=int(msg.gait_type),
+            position=[float(v) for v in msg.position],
+            body_height=float(msg.body_height),
+            velocity=[float(v) for v in msg.velocity],
+            range_obstacle=[float(v) for v in msg.range_obstacle],
+            foot_force=[int(v) for v in msg.foot_force],
+            foot_position_body=[float(v) for v in msg.foot_position_body],
+            foot_speed_body=[float(v) for v in msg.foot_speed_body],
+        )
+        imu_values = (list(imu.quaternion) + list(imu.accelerometer) +
+                      list(imu.gyroscope) + list(imu.rpy))
+        if all(math.isfinite(v) for v in imu_values):
+            robot_data.imu_data = IMUData(
+                quaternion=[float(v) for v in imu.quaternion],
+                accelerometer=[float(v) for v in imu.accelerometer],
+                gyroscope=[float(v) for v in imu.gyroscope],
+                rpy=[float(v) for v in imu.rpy],
+                temperature=int(imu.temperature),
+            )
+        self.ros2_publisher.publish_robot_state(robot_data)
 
     def _on_cyclonedds_pose(self, msg: PoseStamped) -> None:
-        """Processing pose for CycloneDDS"""
-        # You can add processing for CycloneDDS here if needed
-        pass
+        """robot_pose -> odom topic and odom->base_link TF"""
+        p = msg.pose.position
+        o = msg.pose.orientation
+        if not all(math.isfinite(v) for v in (p.x, p.y, p.z, o.x, o.y, o.z, o.w)):
+            return
+
+        robot_data = RobotData(robot_id="0", timestamp=0.0)
+        robot_data.odometry_data = OdometryData(
+            position={'x': p.x, 'y': p.y, 'z': p.z},
+            orientation={'x': o.x, 'y': o.y, 'z': o.z, 'w': o.w},
+        )
+        self.ros2_publisher.publish_odometry(robot_data)
 
     def _on_cyclonedds_lidar(self, msg: PointCloud2) -> None:
-        """Processing lidar for CycloneDDS"""
-        # You can add processing for CycloneDDS here if needed
-        pass
+        """Robot lidar cloud -> point_cloud2 (already a PointCloud2, so pass it through)"""
+        if not self._lidar_frame_logged:
+            self.get_logger().info(
+                f"CycloneDDS: first lidar cloud received, frame_id='{msg.header.frame_id}', "
+                f"{msg.width * msg.height} points")
+            self._lidar_frame_logged = True
+
+        if not self.config.decode_lidar:
+            return
+        msg.header.stamp = self.get_clock().now().to_msg()
+        self.publishers_dict['lidar'][0].publish(msg)
 
     async def connect_robots(self) -> None:
         """Connect to robots"""
